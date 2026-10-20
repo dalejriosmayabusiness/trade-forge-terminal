@@ -36,6 +36,9 @@ Top-left of the chart. Rows: status, account (DEMO/REAL), terminal, strategy, mo
 * `-` / `+` collapses the panel.
 * To stop a terminal from Maya instead, set `Terminal.enabled = false` (the panel shows "Disabled in Maya").
 
+## Version
+The panel's last row shows `vX.Y.Z (built <compile time>)`. It is only for you to check that a recompiled EA is the one running; it is not sent to Maya. The maintainer bumps `TF_VERSION` on every change.
+
 ## Behaviour
 * The terminal loads **all** its configuration from Maya (`terminalConfig`) and refreshes it every 10 minutes; heartbeat and mode changes apply without restarting.
 * Only the **feeder** of an instrument sends candles. Each minute it sends the newest 3 bars of every timeframe, skipping unchanged ones.

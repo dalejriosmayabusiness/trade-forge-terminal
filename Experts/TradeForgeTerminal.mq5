@@ -16,9 +16,9 @@
 #include "../Include/TradeForge/TF_Alerts.mqh"
 #include "../Include/TradeForge/TF_Panel.mqh"
 
-// Bump on EVERY change: it is shown in the panel (with the compile time) and reported to Maya in each heartbeat,
-// so you can tell at a glance that a recompiled EA is the one actually running.
-#define TF_VERSION     "0.21.0"
+// Bump on EVERY change: it is shown in the panel (with the compile time) so you can tell at a glance that a
+// recompiled EA is the one actually running. It is local to the EA: it is not sent to Maya.
+#define TF_VERSION     "0.21.1"
 #define TF_BUILD       __DATETIME__
 #define TF_GV_ACTIVE   "TradeForge_Active"
 
@@ -144,9 +144,9 @@ bool LoadConfig(void)
 //+------------------------------------------------------------------+
 bool Heartbeat(void)
   {
-   string extra="\"version\":"+TF_JStr(TF_VERSION);
+   string extra="";
    if(g_lastError!="")
-      extra+=",\"error\":"+TF_JStr(StringSubstr(g_lastError,0,400));
+      extra="\"error\":"+TF_JStr(StringSubstr(g_lastError,0,400));
    CJv *d=g_maya.Action("terminalHeartbeat",Params(extra));
    if(d==NULL)
      {
