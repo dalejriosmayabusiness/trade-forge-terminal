@@ -8,7 +8,7 @@ Expert Advisor (MQL5) for MetaTrader 5. It is the **terminal** of the TradeForge
 | Login (Bridge), `terminalConfig`, heartbeat | v0.10 (written, not yet compiled/tested in MT5) |
 | Candle feed (`terminalUpsertCandles`) | v0.10 |
 | On-chart panel (status + ON/OFF switch) | v0.10 |
-| Alerts (`terminalPoll` / `terminalReport`) | next |
+| Alerts (`terminalPoll` / `terminalReport`) | v0.20 (written, to be compiled/tested) |
 | Trade execution (LIMIT orders, fills, closes) | after alerts |
 
 ## Layout

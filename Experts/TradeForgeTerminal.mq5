@@ -2,19 +2,24 @@
 //| TradeForgeTerminal.mq5                                           |
 //| TradeForge terminal: talks only to Maya, only obeys orders.      |
 //| Step 1: login, config, heartbeat, candle feed, control panel.    |
-//| (alerts and trade execution come next)                           |
+//| Step 2: price alerts (terminalPoll / terminalReport).            |
+//| (trade execution comes next)                                     |
 //+------------------------------------------------------------------+
 #property copyright "TradeForge"
-#property version   "0.10"
+#property version   "0.21"
 #property description "Terminal of the TradeForge trading system (Maya Business)."
 #property strict
 
 #include "../Include/TradeForge/TF_Json.mqh"
 #include "../Include/TradeForge/TF_Maya.mqh"
 #include "../Include/TradeForge/TF_Candles.mqh"
+#include "../Include/TradeForge/TF_Alerts.mqh"
 #include "../Include/TradeForge/TF_Panel.mqh"
 
-#define TF_VERSION     "0.10.0"
+// Bump on EVERY change: it is shown in the panel (with the compile time) and reported to Maya in each heartbeat,
+// so you can tell at a glance that a recompiled EA is the one actually running.
+#define TF_VERSION     "0.21.0"
+#define TF_BUILD       __DATETIME__
 #define TF_GV_ACTIVE   "TradeForge_Active"
 
 input group "Maya connection"
@@ -40,6 +45,7 @@ enum TFState
 //--- runtime
 CMaya       g_maya;
 CCandleFeed g_feed;
+CAlertMonitor g_alerts;
 CTFPanel    g_panel;
 bool        g_active=true;
 TFState     g_state=ST_PAUSED;
@@ -49,6 +55,8 @@ ulong       g_nextConnectMs=0;
 ulong       g_nextBeatMs=0;
 ulong       g_nextCandlesMs=0;
 ulong       g_nextConfigMs=0;
+ulong       g_nextPollMs=0;
+datetime    g_lastPoll=0;
 int         g_connectFails=0;
 
 //--- configuration loaded from Maya (terminalConfig / terminalHeartbeat)
@@ -58,6 +66,7 @@ bool        g_strategyActive=true;
 string      g_instrument="",g_symbol="";
 string      g_timeframes[];
 int         g_heartbeatSec=30;
+int         g_pollSec=5;            // how often alerts/trades are asked for (Terminal.pollSeconds in Maya)
 bool        g_feeder=false;
 long        g_leaseUntil=0;
 datetime    g_lastBeat=0;           // local time of the last good heartbeat
@@ -105,6 +114,7 @@ bool LoadConfig(void)
    g_terminalName=t.Str("name");
    g_accountLabel=t.Str("accountLabel");
    g_heartbeatSec=(int)MathMax(5,t.Num("heartbeatSeconds",30));
+   g_pollSec=(int)MathMax(2,t.Num("pollSeconds",5));
    g_strategyName=s.Str("name");
    g_strategyKey=s.Str("key");
    g_strategyActive=s.Bool("isActive",true);
@@ -147,6 +157,7 @@ bool Heartbeat(void)
    g_feeder=d.Bool("feeder");
    g_leaseUntil=(long)d.Num("leaseUntilTs",0);
    g_heartbeatSec=(int)MathMax(5,d.Num("heartbeatSeconds",g_heartbeatSec));
+   g_pollSec=(int)MathMax(2,d.Num("pollSeconds",g_pollSec));
    g_mode=d.Str("mode",g_mode);
    g_strategyActive=d.Bool("strategyActive",true);
    string instr=d.Str("instrument");
@@ -158,7 +169,10 @@ bool Heartbeat(void)
      {
       g_feed.Reset();           // new feeder: resend the newest candles
       g_nextCandlesMs=0;
+      g_nextPollMs=0;
      }
+   if(!g_feeder && wasFeeder)
+      g_alerts.Clear();
    if(instr!=g_instrument || sym!=g_symbol)
       g_configured=false;       // the strategy of this terminal changed in Maya: reload
    return true;
@@ -183,8 +197,7 @@ void SendCandles(void)
       string e=g_maya.LastError();
       if(StringFind(e,"NOT_FEEDER")>=0)
         {
-         g_feeder=false;           // lost the lease: the next heartbeat tells who has it now
-         g_nextBeatMs=0;
+         LoseFeed();               // lost the lease: the next heartbeat tells who has it now
         }
       else
          SetError(e);
@@ -198,6 +211,48 @@ void SendCandles(void)
    CJv *errs=d.Get("errors");
    if(errs.Size()>0)
       SetError("Candle rejected: "+errs.At(0).Str("message"));
+  }
+
+//+------------------------------------------------------------------+
+//| terminalReport (alerts) and terminalPoll                         |
+//+------------------------------------------------------------------+
+void LoseFeed(void)
+  {
+   g_feeder=false;
+   g_alerts.Clear();
+   g_nextBeatMs=0;      // ask who has the lease now
+  }
+
+void ReportAlerts(void)
+  {
+   string arr;
+   int n=g_alerts.BuildReport(arr);
+   if(n==0)
+      return;
+   CJv *d=g_maya.Action("terminalReport",Params("\"alerts\":"+arr));
+   if(d==NULL)
+     {
+      SetError("Alert report failed: "+g_maya.LastError());   // kept pending: retried on the next step
+      return;
+     }
+   g_alerts.ApplyReport(d.Get("alerts"));
+  }
+
+void Poll(void)
+  {
+   CJv *d=g_maya.Action("terminalPoll",Params());
+   if(d==NULL)
+     {
+      string e=g_maya.LastError();
+      if(StringFind(e,"NOT_FEEDER")>=0)
+         LoseFeed();
+      else
+         SetError(e);
+      return;
+     }
+   g_lastPoll=TimeLocal();
+   g_alerts.Sync(d.Get("alerts"));
+   // (d.Get("trades") is handled by the trade module, next step)
   }
 
 //+------------------------------------------------------------------+
@@ -242,6 +297,12 @@ void Step(void)
       g_nextConnectMs=0;
       return;
      }
+   // Alerts are local work: watch the ticks every second and deliver a crossing before anything else.
+   if(g_feeder && g_strategyActive)
+     {
+      g_alerts.Monitor(g_symbol);
+      ReportAlerts();
+     }
    if(now>=g_nextBeatMs)
      {
       if(Heartbeat())
@@ -260,6 +321,12 @@ void Step(void)
          else
             g_nextBeatMs=now+(ulong)MathMin(g_heartbeatSec,15)*1000;
         }
+      return;
+     }
+   if(g_feeder && g_strategyActive && now>=g_nextPollMs)
+     {
+      Poll();
+      g_nextPollMs=GetTickCount64()+(ulong)g_pollSec*1000;
       return;
      }
    if(g_feeder && g_strategyActive && now>=g_nextCandlesMs)
@@ -310,12 +377,16 @@ void RefreshPanel(void)
    r[5].clr=TXT;
    r[6].value=!g_configured ? "-" : (g_feeder ? "YES - sending candles" : "No - standby (another terminal feeds)");
    r[6].clr=g_feeder ? OK : DIM;
-   r[7].value=g_configured ? "every "+IntegerToString(g_heartbeatSec)+" s - last "+Ago(g_lastBeat) : "-";
+   r[7].value=g_configured ? "every "+IntegerToString(g_heartbeatSec)+" s (poll "+IntegerToString(g_pollSec)+" s) - last "+Ago(g_lastBeat) : "-";
    r[7].clr=TXT;
    r[8].value=g_lastCandles==0 ? "-" : IntegerToString(g_lastCandleCount)+" in "+IntegerToString(g_lastCandleMs)+" ms - "+Ago(g_lastCandles)+" - total "+IntegerToString(g_candlesSent);
    r[8].clr=TXT;
-   r[9].value=g_lastError=="" ? "-" : StringSubstr(g_lastError,0,50);
-   r[9].clr=g_lastError=="" ? DIM : BAD;
+   r[9].value=!g_feeder ? "-" : IntegerToString(g_alerts.Count())+" watching ("+IntegerToString(g_alerts.CountAbove())+" above, "+IntegerToString(g_alerts.Count()-g_alerts.CountAbove())+" below) - "+IntegerToString(g_alerts.TriggeredTotal())+" triggered";
+   r[9].clr=TXT;
+   r[11].value="v"+TF_VERSION+"  (built "+TimeToString(TF_BUILD,TIME_DATE|TIME_MINUTES)+")";
+   r[11].clr=DIM;
+   r[10].value=g_lastError=="" ? "-" : StringSubstr(g_lastError,0,50);
+   r[10].clr=g_lastError=="" ? DIM : BAD;
    g_panel.SetSwitch(g_active);
    g_panel.SetRows(r);
   }
@@ -337,6 +408,7 @@ void SetActive(const bool on)
      {
       g_state=ST_PAUSED;
       g_feeder=false;
+      g_alerts.Clear();
       Print("TradeForge: paused (no more heartbeats; Maya will release the lease)");
      }
    RefreshPanel();
@@ -356,7 +428,7 @@ int OnInit()
       g_panel.Create(0,PanelX,PanelY,PanelScale);
    RefreshPanel();
    EventSetTimer(1);
-   Print("TradeForge terminal ",TF_VERSION," started (",g_active ? "active" : "paused",")");
+   Print("TradeForge terminal v",TF_VERSION," built ",TimeToString(TF_BUILD,TIME_DATE|TIME_MINUTES)," started (",g_active ? "active" : "paused",")");
    return INIT_SUCCEEDED;
   }
 
