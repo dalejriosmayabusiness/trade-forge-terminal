@@ -207,12 +207,59 @@ TFCmdState CBackfillCommand::Step(CCmdContext &ctx,double &progress,string &mess
   }
 
 //+------------------------------------------------------------------+
+//| SYNC_INSTRUMENT: reports the real contract specification         |
+//+------------------------------------------------------------------+
+class CSyncInstrumentCommand : public CCommand
+  {
+public:
+   virtual TFCmdState Step(CCmdContext &ctx,double &progress,string &message,string &resultJson);
+   virtual string    Label(void) { return "Sync instrument"; }
+  };
+
+TFCmdState CSyncInstrumentCommand::Step(CCmdContext &ctx,double &progress,string &message,string &resultJson)
+  {
+   string s=ctx.symbol;
+   double tickSize=SymbolInfoDouble(s,SYMBOL_TRADE_TICK_SIZE);
+   // Value of ONE tick for ONE lot in the account currency, for a LOSS (what the risk calculation needs)
+   double tickValue=SymbolInfoDouble(s,SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tickValue<=0)
+      tickValue=SymbolInfoDouble(s,SYMBOL_TRADE_TICK_VALUE);
+   double minLot=SymbolInfoDouble(s,SYMBOL_VOLUME_MIN);
+   double lotStep=SymbolInfoDouble(s,SYMBOL_VOLUME_STEP);
+   double maxLot=SymbolInfoDouble(s,SYMBOL_VOLUME_MAX);
+   int digits=(int)SymbolInfoInteger(s,SYMBOL_DIGITS);
+   double point=SymbolInfoDouble(s,SYMBOL_POINT);
+   double pip=(digits==3 || digits==5) ? point*10.0 : point;   // 5-digit FX and 3-digit JPY: a pip is 10 points
+   if(tickSize<=0 || tickValue<=0 || minLot<=0 || lotStep<=0 || maxLot<=0 || point<=0)
+     {
+      message="MT5 returned an incomplete specification for "+s+" (is the symbol quoted?)";
+      return CMD_FAILED;
+     }
+   string spec="{\"tickSize\":"+DoubleToString(tickSize,10)+",\"tickValue\":"+DoubleToString(tickValue,6)+",\"minLot\":"+DoubleToString(minLot,4)+
+               ",\"lotStep\":"+DoubleToString(lotStep,4)+",\"maxLot\":"+DoubleToString(maxLot,2)+",\"pipSize\":"+DoubleToString(pip,10)+"}";
+   CJv *d=ctx.maya.Action("terminalSyncInstrument",ctx.Params("\"spec\":"+spec));
+   if(d==NULL)
+     {
+      message="Maya rejected the specification: "+StringSubstr(ctx.maya.LastError(),0,200);
+      return CMD_FAILED;
+     }
+   int n=d.Get("changed").Size();
+   progress=100;
+   message=s+": tick "+DoubleToString(tickSize,digits+1)+" = "+DoubleToString(tickValue,2)+" "+AccountInfoString(ACCOUNT_CURRENCY)+", lots "+
+           DoubleToString(minLot,2)+" - "+DoubleToString(maxLot,0)+" step "+DoubleToString(lotStep,2)+(n>0 ? " ("+IntegerToString(n)+" values changed)" : " (no changes)");
+   resultJson="{\"symbol\":"+TF_JStr(s)+",\"changed\":"+IntegerToString(n)+",\"account\":"+TF_JStr(AccountInfoString(ACCOUNT_CURRENCY))+"}";
+   return CMD_DONE;
+  }
+
+//+------------------------------------------------------------------+
 //| Factory: the one place that knows which types this EA supports   |
 //+------------------------------------------------------------------+
 CCommand *TF_CreateCommand(const string type)
   {
    if(type=="BACKFILL_CANDLES")
       return new CBackfillCommand();
+   if(type=="SYNC_INSTRUMENT")
+      return new CSyncInstrumentCommand();
    // if(type=="NEW_TYPE") return new CNewTypeCommand();
    return NULL;
   }

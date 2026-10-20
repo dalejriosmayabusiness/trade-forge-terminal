@@ -7,7 +7,7 @@
 //| Step 4: commands from Maya (backfill of candle history).         |
 //+------------------------------------------------------------------+
 #property copyright "TradeForge"
-#property version   "0.40"
+#property version   "0.41"
 #property description "Terminal of the TradeForge trading system (Maya Business)."
 #property strict
 
@@ -21,7 +21,7 @@
 
 // Bump on EVERY change: it is shown in the panel (with the compile time) so you can tell at a glance that a
 // recompiled EA is the one actually running. It is local to the EA: it is not sent to Maya.
-#define TF_VERSION     "0.40.0"
+#define TF_VERSION     "0.41.0"
 #define TF_BUILD       __DATETIME__
 #define TF_GV_ACTIVE   "TradeForge_Active"
 
