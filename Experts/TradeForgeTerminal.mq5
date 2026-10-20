@@ -3,10 +3,11 @@
 //| TradeForge terminal: talks only to Maya, only obeys orders.      |
 //| Step 1: login, config, heartbeat, candle feed, control panel.    |
 //| Step 2: price alerts (terminalPoll / terminalReport).            |
-//| (trade execution comes next)                                     |
+//| Step 3: trade execution (LIMIT orders, fills, closes).           |
+//| Step 4: commands from Maya (backfill of candle history).         |
 //+------------------------------------------------------------------+
 #property copyright "TradeForge"
-#property version   "0.21"
+#property version   "0.40"
 #property description "Terminal of the TradeForge trading system (Maya Business)."
 #property strict
 
@@ -14,11 +15,13 @@
 #include "../Include/TradeForge/TF_Maya.mqh"
 #include "../Include/TradeForge/TF_Candles.mqh"
 #include "../Include/TradeForge/TF_Alerts.mqh"
+#include "../Include/TradeForge/TF_Trades.mqh"
+#include "../Include/TradeForge/TF_Commands.mqh"
 #include "../Include/TradeForge/TF_Panel.mqh"
 
 // Bump on EVERY change: it is shown in the panel (with the compile time) so you can tell at a glance that a
 // recompiled EA is the one actually running. It is local to the EA: it is not sent to Maya.
-#define TF_VERSION     "0.21.1"
+#define TF_VERSION     "0.40.0"
 #define TF_BUILD       __DATETIME__
 #define TF_GV_ACTIVE   "TradeForge_Active"
 
@@ -33,6 +36,9 @@ input bool   ShowPanel     = true; // Show the control panel on the chart
 input int    PanelX        = 12;   // Panel X
 input int    PanelY        = 24;   // Panel Y
 input int    PanelScale    = 0;    // Panel size in % (0 = automatic from the screen DPI)
+input group "Trading"
+input TF_DstRule ServerDstRule = TF_DST_EU; // How the broker server clock switches summer/winter time (only used to convert HISTORY to UTC)
+input long   MagicNumber   = 4455001; // Magic number of the orders this EA places (use the same on every EA of the account)
 
 enum TFState
   {
@@ -46,6 +52,9 @@ enum TFState
 CMaya       g_maya;
 CCandleFeed g_feed;
 CAlertMonitor g_alerts;
+CTradeBook  g_trades;
+CCommandRunner g_cmds;
+CCmdContext g_cmdCtx;
 CTFPanel    g_panel;
 bool        g_active=true;
 TFState     g_state=ST_PAUSED;
@@ -136,7 +145,21 @@ bool LoadConfig(void)
       SetError("Symbol '"+g_symbol+"' does not exist in this broker (set Terminal.symbolMap in Maya)");
       return false;
      }
+   g_cmdCtx.clock.Init(ServerDstRule);
    return true;
+  }
+
+//+------------------------------------------------------------------+
+//| Commands from Maya                                               |
+//+------------------------------------------------------------------+
+void PrepareCommandContext(void)
+  {
+   g_cmdCtx.maya=GetPointer(g_maya);
+   g_cmdCtx.symbol=g_symbol;
+   g_cmdCtx.feeder=g_feeder;
+   ArrayResize(g_cmdCtx.timeframes,ArraySize(g_timeframes));
+   for(int i=0;i<ArraySize(g_timeframes);i++)
+      g_cmdCtx.timeframes[i]=g_timeframes[i];
   }
 
 //+------------------------------------------------------------------+
@@ -163,6 +186,8 @@ bool Heartbeat(void)
    string instr=d.Str("instrument");
    string sym=d.Str("symbol");
    g_lastBeat=TimeLocal();
+   PrepareCommandContext();
+   g_cmds.Sync(d.Get("commands"),g_cmdCtx);
    if(g_lastError!="" && !IsFatal(g_lastError))
       g_lastError="";   // reported once, then clear
    if(g_feeder && !wasFeeder)
@@ -172,7 +197,10 @@ bool Heartbeat(void)
       g_nextPollMs=0;
      }
    if(!g_feeder && wasFeeder)
+     {
       g_alerts.Clear();
+      g_trades.Clear();
+     }
    if(instr!=g_instrument || sym!=g_symbol)
       g_configured=false;       // the strategy of this terminal changed in Maya: reload
    return true;
@@ -214,12 +242,42 @@ void SendCandles(void)
   }
 
 //+------------------------------------------------------------------+
+//| Trades: reconcile with the broker and report what happened       |
+//+------------------------------------------------------------------+
+void ReconcileTrades(void)
+  {
+   if(g_trades.Count()==0)
+      return;
+   int n=g_trades.Reconcile(g_symbol,MagicNumber);
+   if(g_trades.LastIssue()!="")
+     {
+      SetError(g_trades.LastIssue());
+      g_trades.ClearIssue();
+     }
+   if(n==0)
+      return;
+   CJv *d=g_maya.Action("terminalReport",Params("\"trades\":"+g_trades.BuildReport()),20000);
+   if(d==NULL)
+     {
+      SetError("Trade report failed: "+g_maya.LastError());   // nothing is lost: the next pass finds the same state and reports again
+      return;
+     }
+   g_trades.ApplyReport(d.Get("trades"));
+   if(g_trades.LastIssue()!="")
+     {
+      SetError(g_trades.LastIssue());
+      g_trades.ClearIssue();
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| terminalReport (alerts) and terminalPoll                         |
 //+------------------------------------------------------------------+
 void LoseFeed(void)
   {
    g_feeder=false;
    g_alerts.Clear();
+   g_trades.Clear();
    g_nextBeatMs=0;      // ask who has the lease now
   }
 
@@ -252,7 +310,7 @@ void Poll(void)
      }
    g_lastPoll=TimeLocal();
    g_alerts.Sync(d.Get("alerts"));
-   // (d.Get("trades") is handled by the trade module, next step)
+   g_trades.Sync(d.Get("trades"));
   }
 
 //+------------------------------------------------------------------+
@@ -303,6 +361,8 @@ void Step(void)
       g_alerts.Monitor(g_symbol);
       ReportAlerts();
      }
+   if(g_feeder)
+      ReconcileTrades();        // orders, fills and closes are followed even if the strategy was switched off
    if(now>=g_nextBeatMs)
      {
       if(Heartbeat())
@@ -323,7 +383,7 @@ void Step(void)
         }
       return;
      }
-   if(g_feeder && g_strategyActive && now>=g_nextPollMs)
+   if(g_feeder && now>=g_nextPollMs)
      {
       Poll();
       g_nextPollMs=GetTickCount64()+(ulong)g_pollSec*1000;
@@ -333,6 +393,15 @@ void Step(void)
      {
       SendCandles();
       g_nextCandlesMs=GetTickCount64()+60000;
+      return;
+     }
+   // Lowest priority: a command (e.g. backfill) works in slices whenever nothing above is due.
+   if(g_cmds.Active())
+     {
+      PrepareCommandContext();
+      g_cmds.Tick(g_cmdCtx);
+      if(!g_cmdCtx.feeder && g_feeder)
+         LoseFeed();
      }
   }
 
@@ -383,10 +452,18 @@ void RefreshPanel(void)
    r[8].clr=TXT;
    r[9].value=!g_feeder ? "-" : IntegerToString(g_alerts.Count())+" watching ("+IntegerToString(g_alerts.CountAbove())+" above, "+IntegerToString(g_alerts.Count()-g_alerts.CountAbove())+" below) - "+IntegerToString(g_alerts.TriggeredTotal())+" triggered";
    r[9].clr=TXT;
-   r[11].value="v"+TF_VERSION+"  (built "+TimeToString(TF_BUILD,TIME_DATE|TIME_MINUTES)+")";
-   r[11].clr=DIM;
-   r[10].value=g_lastError=="" ? "-" : StringSubstr(g_lastError,0,50);
-   r[10].clr=g_lastError=="" ? DIM : BAD;
+   r[13].value="v"+TF_VERSION+"  (built "+TimeToString(TF_BUILD,TIME_DATE|TIME_MINUTES)+")";
+   r[13].clr=DIM;
+   int tp,tl,to;
+   double fl;
+   g_trades.Stats(tp,tl,to,fl);
+   bool algo=(TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED));
+   r[10].value=!g_feeder ? "-" : (algo ? "" : "ALGO TRADING OFF - ")+IntegerToString(tp)+" to place, "+IntegerToString(tl)+" placed, "+IntegerToString(to)+" open"+(to>0 ? " ("+(fl>=0 ? "+" : "")+DoubleToString(fl,2)+" "+AccountInfoString(ACCOUNT_CURRENCY)+")" : "");
+   r[10].clr=(g_feeder && !algo) ? BAD : TXT;
+   r[11].value=g_cmds.Status();
+   r[11].clr=g_cmds.Active() ? WARN : DIM;
+   r[12].value=g_lastError=="" ? "-" : StringSubstr(g_lastError,0,50);
+   r[12].clr=g_lastError=="" ? DIM : BAD;
    g_panel.SetSwitch(g_active);
    g_panel.SetRows(r);
   }
@@ -409,6 +486,8 @@ void SetActive(const bool on)
       g_state=ST_PAUSED;
       g_feeder=false;
       g_alerts.Clear();
+      g_trades.Clear();
+      g_cmds.Abort();
       Print("TradeForge: paused (no more heartbeats; Maya will release the lease)");
      }
    RefreshPanel();

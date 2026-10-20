@@ -220,4 +220,201 @@ void CCandleFeed::Commit(void)
          m_sig[i]=m_new[i];
   }
 
+//+------------------------------------------------------------------+
+//| Candle HISTORY (backfill): closed candles, ascending, UTC-aligned |
+//+------------------------------------------------------------------+
+enum TF_DstRule
+  {
+   TF_DST_EU=0,     // server clock follows European summer time (last Sun Mar -> last Sun Oct)
+   TF_DST_US=1,     // server clock follows US summer time (2nd Sun Mar -> 1st Sun Nov)
+   TF_DST_NONE=2    // fixed offset all year
+  };
+
+int TF_StepSec(const string tf)
+  {
+   if(tf=="M5")  return 300;
+   if(tf=="M15") return 900;
+   if(tf=="H1")  return 3600;
+   if(tf=="H4")  return 14400;
+   if(tf=="D1")  return 86400;
+   if(tf=="W1")  return 604800;
+   return 0;
+  }
+
+ENUM_TIMEFRAMES TF_MtFrame(const string tf)
+  {
+   if(tf=="M5")  return PERIOD_M5;
+   if(tf=="M15") return PERIOD_M15;
+   if(tf=="H1")  return PERIOD_H1;
+   return PERIOD_CURRENT;
+  }
+
+long TF_PeriodStartOf(const string tf,const long t)
+  {
+   long step=TF_StepSec(tf);
+   if(tf=="W1")
+      return ((t-TF_WEEK_OFFSET)/step)*step+TF_WEEK_OFFSET;
+   return (t/step)*step;
+  }
+
+//--- Nth Sunday (n=-1: last) of a month at the given UTC hour, as a UTC epoch
+long TF_SundayOf(const int year,const int month,const int n,const int hourUtc)
+  {
+   MqlDateTime d;
+   d.year=year; d.mon=month; d.day=1; d.hour=0; d.min=0; d.sec=0;
+   if(n>0)
+     {
+      datetime first=StructToTime(d);
+      TimeToStruct(first,d);
+      int add=(7-d.day_of_week)%7;                 // days until the first Sunday
+      return (long)first+(long)(add+7*(n-1))*86400+hourUtc*3600;
+     }
+   d.mon=month+1;                                   // last Sunday: step back from the 1st of next month
+   if(d.mon>12) { d.mon=1; d.year=year+1; }
+   datetime next=StructToTime(d);
+   TimeToStruct(next-86400,d);                      // last day of the month
+   int back=d.day_of_week;                          // Sunday=0
+   return (long)(next-86400)-(long)back*86400+hourUtc*3600-86400*0;
+  }
+
+bool TF_DstActive(const long utc,const TF_DstRule rule)
+  {
+   if(rule==TF_DST_NONE)
+      return false;
+   MqlDateTime d;
+   TimeToStruct((datetime)utc,d);
+   long from,to;
+   if(rule==TF_DST_EU)
+     {
+      from=TF_SundayOf(d.year,3,-1,1);
+      to=TF_SundayOf(d.year,10,-1,1);
+     }
+   else
+     {
+      from=TF_SundayOf(d.year,3,2,7);
+      to=TF_SundayOf(d.year,11,1,6);
+     }
+   return (utc>=from && utc<to);
+  }
+
+//--- Broker server time -> UTC for a PAST time, honouring the daylight-saving switch of the server clock.
+class CServerClock
+  {
+private:
+   long              m_winter;     // server offset in winter, seconds
+   TF_DstRule        m_rule;
+public:
+   void              Init(const TF_DstRule rule)
+     {
+      m_rule=rule;
+      long now=(long)TimeGMT();
+      long cur=(long)MathRound((double)((long)TimeTradeServer()-now)/900.0)*900;
+      m_winter=cur-(TF_DstActive(now,rule) ? 3600 : 0);
+     }
+   long              ToUtc(const long serverTs)
+     {
+      long guess=serverTs-m_winter;
+      return TF_DstActive(guess-3600,m_rule) ? serverTs-m_winter-3600 : guess;
+     }
+   long              Winter(void) { return m_winter; }
+  };
+
+class CCandleHistory
+  {
+private:
+   TFCandle          m_c[];
+   int               m_n;
+public:
+                     CCandleHistory(void) : m_n(0) {}
+   int               Size(void) { return m_n; }
+   bool              Get(const int i,TFCandle &c)
+     {
+      if(i<0 || i>=m_n)
+         return false;
+      c=m_c[i];
+      return true;
+     }
+   //--- Loads up to `count` closed candles of `tf` (oldest first). H4/D1/W1 are rebuilt from H1 on UTC boundaries.
+   int               Load(const string symbol,const string tf,const int count,CServerClock &clock);
+  };
+
+int CCandleHistory::Load(const string symbol,const string tf,const int count,CServerClock &clock)
+  {
+   m_n=0;
+   ArrayResize(m_c,0);
+   if(count<=0 || TF_StepSec(tf)==0)
+      return 0;
+   long now=(long)TimeGMT();
+   long step=TF_StepSec(tf);
+   MqlRates r[];
+   ArraySetAsSeries(r,false);
+   if(tf=="H4" || tf=="D1" || tf=="W1")
+     {
+      long perH1=step/3600;
+      int need=(int)MathMin(100000.0,(double)(count+2)*(double)perH1);
+      int got=CopyRates(symbol,PERIOD_H1,0,need,r);       // oldest first, last element = bar in progress
+      if(got<=0)
+         return 0;
+      TFCandle tmp[];
+      int nb=0;
+      long firstHour=0;
+      for(int i=0;i<got;i++)
+        {
+         long u=clock.ToUtc((long)r[i].time);
+         long ps=TF_PeriodStartOf(tf,u);
+         if(nb==0 || tmp[nb-1].ts!=ps)
+           {
+            ArrayResize(tmp,nb+1);
+            tmp[nb].ts=ps;
+            tmp[nb].o=r[i].open;
+            tmp[nb].h=r[i].high;
+            tmp[nb].l=r[i].low;
+            tmp[nb].c=r[i].close;
+            tmp[nb].v=(long)r[i].tick_volume;
+            tmp[nb].closed=(ps+step<=now);
+            if(nb==0) firstHour=u;
+            nb++;
+           }
+         else
+           {
+            if(r[i].high>tmp[nb-1].h) tmp[nb-1].h=r[i].high;
+            if(r[i].low<tmp[nb-1].l)  tmp[nb-1].l=r[i].low;
+            tmp[nb-1].c=r[i].close;
+            tmp[nb-1].v+=(long)r[i].tick_volume;
+           }
+        }
+      int from=(nb>0 && firstHour>tmp[0].ts) ? 1 : 0;   // the oldest bucket may start mid-period: drop it
+      ArrayResize(m_c,nb);
+      for(int i=from;i<nb;i++)
+         if(tmp[i].closed)
+            m_c[m_n++]=tmp[i];
+      if(m_n>count)                                            // keep the newest `count`
+        {
+         int drop=m_n-count;
+         for(int i=0;i<count;i++)
+            m_c[i]=m_c[i+drop];
+         m_n=count;
+        }
+      ArrayResize(m_c,m_n);
+      return m_n;
+     }
+   // direct timeframes: skip bar 0 (still forming)
+   int got=CopyRates(symbol,TF_MtFrame(tf),1,count,r);
+   if(got<=0)
+      return 0;
+   ArrayResize(m_c,got);
+   for(int i=0;i<got;i++)
+     {
+      m_c[i].ts=clock.ToUtc((long)r[i].time);
+      m_c[i].o=r[i].open;
+      m_c[i].h=r[i].high;
+      m_c[i].l=r[i].low;
+      m_c[i].c=r[i].close;
+      m_c[i].v=(long)r[i].tick_volume;
+      m_c[i].closed=true;
+     }
+   m_n=got;
+   return m_n;
+  }
+
 #endif

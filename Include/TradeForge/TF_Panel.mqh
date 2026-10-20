@@ -6,7 +6,7 @@
 #define TF_PANEL_MQH
 
 #define TFP_PREFIX "TFP_"
-#define TFP_ROWS   12
+#define TFP_ROWS   14
 
 enum TF_PanelAction
   {
@@ -124,7 +124,7 @@ void CTFPanel::Create(const long chart,const int x,const int y,const int scalePe
    m_headH=U(40);
    m_x=x;
    m_y=y;
-   string names[TFP_ROWS]={"Status","Account","Terminal","Strategy","Mode","Instrument","Feeder","Heartbeat","Candles","Alerts","Last error","Version"};
+   string names[TFP_ROWS]={"Status","Account","Terminal","Strategy","Mode","Instrument","Feeder","Heartbeat","Candles","Alerts","Trades","Command","Last error","Version"};
    for(int i=0;i<TFP_ROWS;i++)
       m_labels[i]=names[i];
 
